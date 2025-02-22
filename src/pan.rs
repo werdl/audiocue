@@ -7,30 +7,34 @@ use std::time::Duration;
 enum PanDir {
     Left,
     Right,
-
-    /// 3 channel audio, for instance
     Center,
 }
 
-fn pan_dir(channel_count: u16, current_channel: u16) -> PanDir {
+enum TiltDir {
+    Front,
+    Rear,
+    Center,
+}
+
+fn pan_dir(channel_count: u16, current_channel: u16) -> (PanDir, TiltDir) {
     match channel_count {
-        1 => PanDir::Center,
+        1 => (PanDir::Center, TiltDir::Center),
         2 => match current_channel {
-            0 => PanDir::Left,
-            1 => PanDir::Right,
+            0 => (PanDir::Left, TiltDir::Center),
+            1 => (PanDir::Right, TiltDir::Center),
             _ => unreachable!(),
         },
         3 => match current_channel {
-            0 => PanDir::Left,
-            1 => PanDir::Center,
-            2 => PanDir::Right,
+            0 => (PanDir::Left, TiltDir::Center),
+            1 => (PanDir::Right, TiltDir::Center),
+            2 => (PanDir::Center, TiltDir::Center),
             _ => unreachable!(),
         },
         4 => match current_channel {
-            0 => PanDir::Left, // front left
-            1 => PanDir::Right, // front right
-            2 => PanDir::Left, // rear left
-            3 => PanDir::Right, // rear right
+            0 => (PanDir::Left, TiltDir::Front),
+            1 => (PanDir::Right, TiltDir::Front),
+            2 => (PanDir::Left, TiltDir::Rear),
+            3 => (PanDir::Right, TiltDir::Rear),
             _ => unreachable!(),
         },
         _ => unimplemented!("Pan not implemented for {} channels", channel_count),
@@ -38,7 +42,8 @@ fn pan_dir(channel_count: u16, current_channel: u16) -> PanDir {
 }
 
 pub struct Panned<S: Sound> {
-    pub pan: f32,
+    pub pan_lr: f32,
+    pub pan_fb: f32,
     pub sound: S,
     pub current_channel: u16,
 }
@@ -54,7 +59,7 @@ impl<S: Sound> Sound for Panned<S> {
 
     fn next_sample(&mut self) -> Result<NextSample, Error> {
         let next = self.sound.next_sample()?;
-                
+
         // increase the channel count if the current channel is less than the channel count, else reset the channel count to 0
         self.current_channel = if self.current_channel < self.channel_count() - 1 {
             self.current_channel + 1
@@ -64,14 +69,26 @@ impl<S: Sound> Sound for Panned<S> {
 
         Ok(match next {
             NextSample::Sample(s) => {
-            let pan = self.pan;
-            let dir = pan_dir(self.channel_count(), self.current_channel);
-            let adjusted = match dir {
-                PanDir::Left => (s as f32 * (1.0 + pan)) as i16,
-                PanDir::Right => (s as f32 * (1.0 - pan)) as i16,
-                PanDir::Center => s,
+            let pan_lr = self.pan_lr;
+            let pan_fb = self.pan_fb;
+            let (pan_dir, tilt_dir) = pan_dir(self.channel_count(), self.current_channel);
+            // -1.0 is left, 1.0 is right
+            // -1.0 is front, 1.0 is rear
+
+            let adjusted_lr = match pan_dir {
+                PanDir::Left => s as f32 * (1.0 + pan_lr),
+                PanDir::Right => s as f32 * (1.0 - pan_lr),
+                PanDir::Center => s as f32,
             };
-            NextSample::Sample(adjusted)
+
+            let adjusted_fb = match tilt_dir {
+                TiltDir::Front => adjusted_lr as f32 * (1.0 + pan_fb),
+                TiltDir::Rear => adjusted_lr as f32 * (1.0 - pan_fb),
+                TiltDir::Center => adjusted_lr as f32,
+            };
+            
+
+            NextSample::Sample(adjusted_fb as i16)
             }
             NextSample::MetadataChanged
             | NextSample::Paused
@@ -91,18 +108,20 @@ pub trait Pan where Self: Sound {
         Self: Sized,
     {
         Panned {
-            pan: 0.0,
+            pan_lr: 0.0,
+            pan_fb: 0.0,
             sound: self,
             current_channel: 0,
         }
     }
 
-    fn with_adjustable_pan_of(self, pan: f32) -> Panned<Self>
+    fn with_adjustable_pan_of(self, pan_left_right: f32, pan_front_back: f32) -> Panned<Self>
     where
         Self: Sized,
     {
         Panned {
-            pan,
+            pan_lr: pan_left_right,
+            pan_fb: pan_front_back,
             sound: self,
             current_channel: 0,
         }
@@ -110,20 +129,22 @@ pub trait Pan where Self: Sound {
 }
 
 pub trait SetPan where Self: Sound {
-    fn set_pan(&mut self, pan: f32);
+    fn set_pan(&mut self, pan_lr: f32, pan_fb: f32);
 }
 
 impl<S: Sound> Pan for S {}
 
 impl<S: Sound> SetPan for Panned<S> {
-    fn set_pan(&mut self, pan: f32) {
-        self.pan = pan;
+    fn set_pan(&mut self, pan_lr: f32, pan_fb: f32) {
+        self.pan_lr = pan_lr;
+        self.pan_fb = pan_fb;
     }
 }
 
 pub struct AdjustablePan<S: Sound> {
     inner: S,
-    pan_adjustment: f32,
+    pan_lr: f32,
+    pan_fb: f32,
 }
 
 impl<S> AdjustablePan<S>
@@ -133,14 +154,16 @@ where
     pub fn new(inner: S) -> Self {
         AdjustablePan {
             inner,
-            pan_adjustment: 0.0,
+            pan_lr: 0.0,
+            pan_fb: 0.0,
         }
     }
 
-    pub fn new_with_pan(inner: S, pan_adjustment: f32) -> Self {
+    pub fn new_with_pan(inner: S, pan_lr: f32, pan_fb: f32) -> Self {
         AdjustablePan {
             inner,
-            pan_adjustment,
+            pan_lr,
+            pan_fb,
         }
     }
 
@@ -173,8 +196,9 @@ where
         let next = self.inner.next_sample()?;
         Ok(match next {
             NextSample::Sample(s) => {
-                let adjusted = (s as f32 * self.pan_adjustment) as i16;
-                NextSample::Sample(adjusted)
+                let adjusted_lr = (s as f32 * self.pan_lr) as i16;
+                let adjusted_fb = (adjusted_lr as f32 * self.pan_fb) as i16;
+                NextSample::Sample(adjusted_fb)
             }
             NextSample::MetadataChanged
             | NextSample::Paused
@@ -191,8 +215,12 @@ impl<S> AdjustablePan<S>
 where
     S: Sound,
 {
-    pub fn pan(&self) -> f32 {
-        self.pan_adjustment
+    pub fn pan_lr(&self) -> f32 {
+        self.pan_lr
+    }
+
+    pub fn pan_fb(&self) -> f32 {
+        self.pan_fb
     }
 }
 
@@ -200,8 +228,9 @@ impl<S> SetPan for AdjustablePan<S>
 where
     S: Sound,
 {
-    fn set_pan(&mut self, new: f32) {
-        self.pan_adjustment = new;
+    fn set_pan(&mut self, pan_lr: f32, pan_fb: f32) {
+        self.pan_lr = pan_lr;
+        self.pan_fb = pan_fb;
     }
 }
 
@@ -237,8 +266,8 @@ impl<S> SetPan for AdjustableVolume<S>
 where
     S: Sound + SetPan,
 {
-    fn set_pan(&mut self, pan: f32) {
-        self.inner_mut().set_pan(pan)
+    fn set_pan(&mut self, pan_lr: f32, pan_fb: f32) {
+        self.inner_mut().set_pan(pan_lr, pan_fb)
     }
 }
 
@@ -246,17 +275,16 @@ impl<S> SetPan for AdjustableSpeed<S>
 where
     S: Sound + SetPan,
 {
-    fn set_pan(&mut self, pan: f32) {
-        self.inner_mut().set_pan(pan)
+    fn set_pan(&mut self, pan_lr: f32, pan_fb: f32) {
+        self.inner_mut().set_pan(pan_lr, pan_fb)
     }
 }
-
 impl<S> SetPan for Pausable<S> 
 where
     S: Sound + SetPan,
 {
-    fn set_pan(&mut self, pan: f32) {
-        self.inner_mut().set_pan(pan)
+    fn set_pan(&mut self, pan_lr: f32, pan_fb: f32) {
+        self.inner_mut().set_pan(pan_lr, pan_fb)
     }
 }
 
@@ -264,8 +292,8 @@ impl<S> SetPan for FinishAfter<S>
 where
     S: Sound + SetPan,
 {
-    fn set_pan(&mut self, pan: f32) {
-        self.inner_mut().set_pan(pan)
+    fn set_pan(&mut self, pan_lr: f32, pan_fb: f32) {
+        self.inner_mut().set_pan(pan_lr, pan_fb)
     }
 }
 
@@ -273,7 +301,16 @@ impl<S> SetPan for Controllable<S>
 where
     S: Sound + SetPan,
 {
-    fn set_pan(&mut self, pan: f32) {
-        self.inner_mut().set_pan(pan)
+    fn set_pan(&mut self, pan_lr: f32, pan_fb: f32) {
+        self.inner_mut().set_pan(pan_lr, pan_fb)
+    }
+}
+
+impl<S> SetPan for CompletionNotifier<S> 
+where
+    S: Sound + SetPan,
+{
+    fn set_pan(&mut self, pan_lr: f32, pan_fb: f32) {
+        self.inner_mut().set_pan(pan_lr, pan_fb)
     }
 }

@@ -1,7 +1,9 @@
+use std::sync::mpsc::Receiver;
+
 use awedio::{
     manager, sounds::{
         self,
-        wrappers::{AdjustableSpeed, AdjustableVolume, Controllable, Pausable, SetPaused, SetSpeed, SetVolume, Wrapper},
+        wrappers::{AdjustableSpeed, AdjustableVolume, CompletionNotifier, Controllable, Pausable, SetPaused, SetSpeed, SetVolume, Wrapper},
         Silence,
     }, Sound
 };
@@ -9,7 +11,9 @@ use awedio::{
 use crate::pan::{Pan, Panned, SetPan};
 
 pub struct AudioPlayer {
-    controller: Controllable<AdjustableSpeed<AdjustableVolume<Panned<Pausable<Box<dyn Sound>>>>>>,
+    controller: Controllable<AdjustableSpeed<AdjustableVolume<CompletionNotifier<Panned<Pausable<Box<dyn Sound>>>>>>>,
+
+    pub completion_notifier: Receiver<()>,
 }
 
 impl std::fmt::Debug for AudioPlayer {
@@ -30,16 +34,20 @@ impl std::fmt::Debug for AudioPlayer {
 }
 
 impl AudioPlayer {
-    pub fn new(volume: f32, speed: f32, pan: f32, file: String) -> Self {
-        let frames = sounds::open_file(file).unwrap()
+    pub fn new(volume: f32, speed: f32, pan_lr: f32, pan_fb: f32, file: String) -> Self {
+        let (frames, completion_notifier) = sounds::open_file(file).unwrap()
             .pausable()
-            .with_adjustable_pan_of(pan)
+            .with_adjustable_pan_of(pan_lr, pan_fb)
+            .with_completion_notifier();
+
+        let frames = frames
             .with_adjustable_volume_of(volume)
             .with_adjustable_speed_of(speed)
             .controllable().0;
 
         Self {
             controller: frames,
+            completion_notifier
         }
     }
 
@@ -51,11 +59,21 @@ impl AudioPlayer {
         self.controller.set_speed(speed);
     }
 
+    pub fn adjust_pan(&mut self, pan_lr: f32, pan_fb: f32) {
+        self.controller.inner_mut().inner_mut().set_pan(pan_lr, pan_fb);
+    }
+
     pub fn play(self, manager: &mut manager::Manager) {
         manager.play(Box::new(self.controller));
     }
 
-    pub fn adjust_pan(&mut self, pan: f32) {
-        self.controller.set_pan(pan);
+    pub fn play_blocking(self, manager: &mut manager::Manager) {
+        manager.play(Box::new(self.controller));
+
+        loop {
+            if self.completion_notifier.try_recv().is_ok() {
+                break;
+            }
+        }
     }
 }
