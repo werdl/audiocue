@@ -1,0 +1,7 @@
+[package]
+name = "audiocue"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+awedio = "0.4.1"
